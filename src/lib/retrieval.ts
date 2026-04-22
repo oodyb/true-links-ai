@@ -102,6 +102,22 @@ function containsClause(text: string, clause: string): boolean {
   return regex.test(text);
 }
 
+// extracts all clause numbers explicitly mentioned in the query — handles both "clause 5" and "14.6"
+function extractMentionedClauses(query: string): string[] {
+  const lowerQuery = query.toLowerCase();
+  const results = new Set<string>();
+
+  // match bare decimals like 14.6, 5.2(a)
+  const decimals = lowerQuery.match(/\d+(?:\.\d+)+(?:\([a-z]\))?/g) ?? [];
+  decimals.forEach(m => results.add(m));
+
+  // match "clause N" or "sub-clause N" where N may be an integer or decimal
+  const explicit = lowerQuery.matchAll(/(?:sub-?clause|clause)\s*([\d]+(?:\.[\d]+)*(?:\([a-z]\))?)/g);
+  for (const match of explicit) results.add(match[1]);
+
+  return [...results];
+}
+
 // primary entry point for finding the most relevant document chunks
 export function retrieve(queryEmbedding: number[], query: string, topK = 5): Chunk[] {
   const chunks = getChunks();
@@ -109,7 +125,17 @@ export function retrieve(queryEmbedding: number[], query: string, topK = 5): Chu
   const lowerQuery = query.toLowerCase();
 
   // identify any explicit clause numbers mentioned in the user query
-  const mentionedNumbers = lowerQuery.match(/\d+(?:\.\d+)+(?:\([a-z]\))?/g) ?? [];
+  const mentionedNumbers = extractMentionedClauses(query);
+
+  // chunks whose clause id was directly referenced get injected regardless of score
+  const exactMatches = mentionedNumbers.flatMap(id =>
+    chunks.filter(c =>
+      c.clause === id ||
+      c.id === id ||
+      c.clause.startsWith(`${id}.`) // pull sub-clauses e.g. 5.1, 5.2 when "clause 5" is asked
+    )
+  );
+  const exactIds = new Set(exactMatches.map(c => c.id));
 
   // calculate basic similarity across vector and keyword spaces
   const rawSignals = chunks.map((c) => ({
@@ -161,9 +187,19 @@ export function retrieve(queryEmbedding: number[], query: string, topK = 5): Chu
   const results: Chunk[] = [];
   const parentCount = new Map<string, number>();
 
-  // select top results while limiting duplicates from the same parent clause
+  // exact clause matches are always included first, consuming slots from the budget
+  for (const chunk of exactMatches) {
+    if (results.length >= topK) break;
+    const parent = chunk.parentClause || chunk.clause;
+    const count = parentCount.get(parent) ?? 0;
+    parentCount.set(parent, count + 1);
+    results.push(chunk);
+  }
+
+  // backfill remaining slots with the top vector+keyword results, skipping already added chunks
   for (const { chunk } of filtered) {
     if (results.length >= topK) break;
+    if (exactIds.has(chunk.id)) continue;
     const parent = chunk.parentClause || chunk.clause;
     const count = parentCount.get(parent) ?? 0;
     if (count >= WEIGHTS.maxPerParent) continue;

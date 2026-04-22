@@ -39,26 +39,19 @@ function CitationLink({ data }: { data: Citation }) {
   // opens the pdf at the specific page with a text search fragment
   const handleClick = useCallback(() => {
     if (!data) return;
-    const snippet = (data.preview || data.title || `Clause ${data.clause}`)
-      .replace(/[^\w\s]/gi, '')
-      .split(' ')
-      .slice(0, 5)
-      .join(' ');
     const page = data.page ?? 1;
-    window.open(
-      `/data/cons1_bc.pdf#page=${page}&search="${encodeURIComponent(snippet)}"`,
-      '_blank'
-    );
+    window.open(`/data/cons1_bc.pdf#page=${page}`, '_blank');
   }, [data]);
 
-  // formats the raw clause identifier for user display
-  const getDisplayName = (val: string) => {
+
+  // formats the raw clause identifier for user display, appends page for non-numeric references
+  const getDisplayName = (val: string, page?: number | null) => {
     if (/^\d+\.\d+/.test(val)) return `Sub-Clause ${val}`;
     if (/^\d+$/.test(val)) return `Clause ${val}`;
-    return val;
+    return page ? `${val} (p.${page})` : val;
   };
 
-  const displayName = getDisplayName(data.clause);
+  const displayName = getDisplayName(data.clause, data.page);
 
   // calculate tailwind classes for tooltip alignment
   const tooltipAlign =

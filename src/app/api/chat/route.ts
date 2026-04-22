@@ -23,6 +23,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+// strips a clean preview from a chunk's raw text — no markers, no headers, trimmed to length
+function extractPreview(text: string, maxWords = 20): string {
+  return text
+    .replace(/<<<PAGE:\d+>>>/g, "")
+    .replace(/\[SUPPLEMENTAL:[^\]]*\]/g, "")
+    .replace(/^(FIDIC Clause|Reference|Sub-Clause)[\s\S]*?\n/i, "")
+    .trim()
+    .split(/\s+/)
+    .slice(0, maxWords)
+    .join(" ");
+}
+
 export async function POST(req: Request) {
   const startTime = Date.now();
   console.log("\n--- NEW REQUEST ---");
@@ -71,17 +83,22 @@ export async function POST(req: Request) {
       });
     }
 
-    // format retrieved chunks into a context block for the model
+    // build a source map keyed by SOURCE_N so citations can be resolved deterministically
+    const sourceMap = Object.fromEntries(
+      topChunks.map((c, i) => [`SOURCE_${i}`, c])
+    );
+
+    // format retrieved chunks with explicit source IDs the model must use for citations
     const context = topChunks
-      .map((c) => {
+      .map((c, i) => {
         const cleanText = c.text
           .replace(/<<<PAGE:\d+>>>/g, "")
           .replace(/\[SUPPLEMENTAL:[^\]]*\]/g, "")
           .trim();
         const header = c.type === "clause"
-          ? `FIDIC Clause ${c.clause}`
+          ? `FIDIC Clause ${c.clause} — ${c.clauseTitle}`
           : `Reference: ${c.clauseTitle}`;
-        return `SOURCE: ${header}\nPAGE: ${c.page}\nCONTENT: ${cleanText}`;
+        return `[SOURCE_${i}] ${header}\nCONTENT: ${cleanText}`;
       })
       .join("\n\n---\n\n");
 
@@ -109,22 +126,20 @@ export async function POST(req: Request) {
 
     // system instructions defining constraints and output format
     const prompt = `
-You are TrueLinks AI, an expert in the FIDIC 1999 Red Book. Use ONLY the provided CONTEXT.
+You are TrueLinks AI, an expert in the FIDIC 1999 Red Book. Use ONLY the provided CONTEXT below.
 
 RULES:
-- NO INLINE PAGE LABELS: Do not write "page X" or "[Page X]" inside the answer text.
-- DETAIL: Do not summarize. Explain procedures, deadlines, and consequences in depth.
-- PRIORITY: Base legal answers on [FIDIC Clause] chunks; use [General/Guidance] for support.
-- NO LEAKING: Never repeat internal markers like "<<<PAGE>>>" or "SOURCE:" in your answer.
-- USE PROVIDED CONTEXT: Only use the retrieved CONTEXT for answering. If the answer is not in the CONTEXT, say you don't know rather than making assumptions.
+- DEPTH: Do not summarize. Explain every procedure, deadline, and consequence in full detail.
+- NO INVENTION: Never use knowledge outside the provided CONTEXT. If the answer is not there, say so.
+- NO LEAKING: Never expose internal markers like "<<<PAGE>>>", "SOURCE:", or "SOURCE_N" in your answer text.
+- NO PAGE LABELS: Never write "page X" or "[Page X]" inside the answer text.
 
 CITATIONS:
-- Add inline citations: [Clause X.X] for numeric IDs, or [Title] for non-numeric (e.g. [Appendix/Forms]).
-- Every citation MUST have a matching object in the JSON "citations" array.
-- "clause" field in JSON must exactly match the identifier in your text (e.g., "14.6" or "Appendix/Forms").
-- "preview" must be 10–15 words taken verbatim from the CONTENT of that clause. No headers or markers.
-- Page numbers belong ONLY in the citations array, never in the answer text.
-- Every sentance you output must have its own citation array
+- Every sentence in your answer MUST end with one or more inline source tags: [SOURCE_0], [SOURCE_1], etc.
+- Only cite SOURCE IDs that actually appear in the CONTEXT above — never invent one.
+- A single sentence may cite multiple sources: e.g. "...the engineer must act impartially. [SOURCE_0][SOURCE_2]"
+- Every SOURCE_N you cite inline MUST have a matching object in the "citations" array.
+- Do NOT include a SOURCE in the citations array unless it is cited inline in the answer.
 
 ${historyBlock}CONTEXT:
 ${context}
@@ -135,22 +150,11 @@ ${userQuery}
 Return ONLY valid JSON (no markdown fences):
 {
   "title": "short title (4-5 words)",
-  "answer": "detailed explanation with inline citations [Clause X.X]",
-  "citations": [
-    {
-      "clause": "14.6",
-      "title": "Interim Payment Certificates",
-      "preview": "10–15 words verbatim from the clause body",
-      "page": 42
-    }
-  ]
+  "answer": "detailed answer where every sentence ends with [SOURCE_N] tags",
+  "citations": ["SOURCE_0", "SOURCE_2"]
 }
 
-STRICT CITATION RULE:
-- ANY mention of a clause or sub-clause (e.g., "Sub-Clause 13.2") MUST:
-  1. Appear as an inline citation [Clause 13.2]
-  2. Have a matching object in the "citations" array
-- DO NOT mention a clause or a sub-clause or any output without citing it.
+The "citations" array must be a flat list of SOURCE IDs (strings) used in the answer, in order of first appearance.
 `;
 
     let result;
@@ -181,7 +185,7 @@ STRICT CITATION RULE:
     const raw = result.response.text().trim();
     console.log(`\n[DEBUG] model output:\n${raw}\n`);
 
-    let parsed: { title: string; answer: string; citations: any[] };
+    let parsed: { title: string; answer: string; citations: string[] };
     try {
       // remove markdown json blocks if present to ensure successful parsing
       const cleaned = raw.replace(/^```json\n?/, "").replace(/\n?```$/, "").trim();
@@ -191,31 +195,36 @@ STRICT CITATION RULE:
       parsed = { title: "New Chat", answer: raw, citations: [] };
     }
 
-    // verify llm citations against retrieved data and fetch missing metadata
-    const enrichedCitations = (parsed.citations ?? []).map((cite: any) => {
-      const rawClause = cite.clause?.toString() ?? "";
-      const normalized = rawClause.toLowerCase().replace(/^(sub-)?clause\s*/i, "").trim();
+    // resolve all citations directly from the source map — page, preview, and title
+    // come entirely from vector store data, never from the model
+    const seenIds = new Set<string>();
+    const enrichedCitations = (parsed.citations ?? [])
+      .filter((id) => {
+        if (!sourceMap[id] || seenIds.has(id)) return false;
+        seenIds.add(id);
+        return true;
+      })
+      .map((id) => {
+        const chunk = sourceMap[id];
+        return {
+          clause: chunk.clause,
+          title: chunk.clauseTitle,
+          preview: extractPreview(chunk.text),
+          page: chunk.page,
+          sourceId: id,
+        };
+      });
 
-      const matchingChunk =
-        topChunks.find((c) => c.id === normalized) ??
-        topChunks.find((c) => c.clause.toLowerCase() === normalized) ??
-        topChunks.find((c) => c.text.toLowerCase().includes(normalized));
-
-      return {
-        ...cite,
-        clause: rawClause.replace(/^(sub-)?clause\s*/i, "").trim() || "Reference",
-        page: matchingChunk?.page ?? cite.page ?? null,
-        preview: cite.preview ?? "",
-      };
-    });
-
-    // clean the final text of internal page markers and fix citation formatting
+    // replace SOURCE_N tags in the answer with their resolved clause identifiers for the frontend
     const finalAnswer = (parsed.answer ?? "")
       .replace(/<<<PAGE:\d+>>>/g, "")
-      .replace(
-        /\[Clause\s+(General\/Guidance|Appendix\/Forms|Appendix\/General|Pre-Clause\/General)\]/gi,
-        "[$1]"
-      )
+      .replace(/\[SOURCE_(\d+)\]/g, (_, n) => {
+        const chunk = sourceMap[`SOURCE_${n}`];
+        if (!chunk) return "";
+        const id = chunk.clause;
+        // format as [Clause X.X] for numeric sub-clauses, bare [Title] for named references
+        return /^\d+(\.\d+)*$/.test(id) ? `[Clause ${id}]` : `[${id}]`;
+      })
       .trim();
 
     console.log(`[FINISH] ${((Date.now() - startTime) / 1000).toFixed(2)}s\n`);
